@@ -1,7 +1,14 @@
 /**
- * Cloudflare Worker 多项目部署管理器 (V9.9.1 - Fix Sync)
+ * Cloudflare Worker 多项目部署管理器 (V9.9.6 - Auto Obfuscate & Favorites)
+ * * 更新日志：
+ * 1. [Auto] 自动更新与熔断机制现在支持服务器端混淆 (Server-Side Obfuscation)。
+ * 2. [Fuse] 修复流量熔断逻辑，确保超过阈值时自动轮换 UUID 并部署。
+ * 3. [UI] 版本管理新增 "查看收藏" 面板，支持管理和回滚收藏版本。
+ * 4. [Fix] 修复 Auto Config 保存逻辑，增加自动混淆开关。
+ */
+
 // ==========================================
-// 1. 项目模板与配置常量
+// 1. 后端配置与逻辑
 // ==========================================
 const TEMPLATES = {
     'cmliu': {
@@ -36,7 +43,6 @@ const TEMPLATES = {
     }
   };
   
-  // [全量补全] ProxyIP 列表
   const ECH_PROXIES = [
       {group:"Global", list:["ProxyIP.CMLiussss.net", "ProxyIP.Aliyun.CMLiussss.net", "ProxyIP.Oracle.CMLiussss.net"]},
       {group:"HK (香港)", list:["ProxyIP.HK.CMLiussss.net", "ProxyIP.Aliyun.HK.CMLiussss.net", "ProxyIP.Oracle.HK.CMLiussss.net"]},
@@ -49,18 +55,16 @@ const TEMPLATES = {
   ];
   
   export default {
-    // ================= 定时任务 (Cron) =================
     async scheduled(event, env, ctx) {
       if (env.CONFIG_KV) {
           ctx.waitUntil(handleCronJob(env));
       }
     },
   
-    // ================= HTTP 请求入口 =================
     async fetch(request, env) {
       try {
           if (!env.CONFIG_KV) {
-              return new Response(`KV Not Bound`, { status: 500 });
+              return new Response(`KV Not Bound (Error 1001)`, { status: 500 });
           }
 
           const url = new URL(request.url);
@@ -122,8 +126,15 @@ const TEMPLATES = {
             }
           }
           if (url.pathname === "/api/check_update") {
-              const { type, mode, limit } = Object.fromEntries(url.searchParams);
-              return await handleCheckUpdate(env, type, mode, limit || 10);
+              const type = url.searchParams.get("type");
+              const mode = url.searchParams.get("mode");
+              const limitStr = url.searchParams.get("limit");
+              const limit = limitStr ? parseInt(limitStr) : 10;
+              return await handleCheckUpdate(env, type, mode, limit);
+          }
+          if (url.pathname === "/api/get_code") {
+              const type = url.searchParams.get("type");
+              return await handleGetCode(env, type);
           }
           if (url.pathname === "/api/deploy" && request.method === "POST") {
             const { type, variables, deletedVariables, targetSha } = await request.json();
@@ -141,7 +152,6 @@ const TEMPLATES = {
               const { accountId, email, globalKey } = await request.json();
               return await handleGetAllWorkers(accountId, email, globalKey);
           }
-          // [重要更新] 传入 env 以便删除时同步更新 KV
           if (url.pathname === "/api/delete_worker" && request.method === "POST") {
               const { accountId, email, globalKey, workerName, deleteKv } = await request.json();
               return await handleDeleteWorker(env, accountId, email, globalKey, workerName, deleteKv);
@@ -164,7 +174,7 @@ const TEMPLATES = {
     }
   };
   
-  // ================= 辅助函数区 =================
+  // ================= 后端辅助函数 =================
   
   function getGithubUrls(type, sha = null) {
       const t = TEMPLATES[type];
@@ -183,6 +193,19 @@ const TEMPLATES = {
       return { "X-Auth-Email": email, "X-Auth-Key": key };
   }
 
+  // [服务器端轻量混淆] 供自动更新/熔断使用，避免依赖 heavy libraries
+  function serverSideObfuscate(code) {
+      // 1. 注入 Window Polyfill
+      if (!code.includes('var window = globalThis')) {
+          code = 'var window = globalThis;\n' + code;
+      }
+      // 2. 移除注释 (简单正则)
+      code = code.replace(/\/\*[\s\S]*?\*\/|([^\\:]|^)\/\/.*$/gm, '$1');
+      // 3. 压缩空白
+      code = code.replace(/^\s+|\s+$/gm, '').replace(/\n+/g, '\n');
+      return code;
+  }
+
   async function handleCronJob(env) {
       const ACCOUNTS_KEY = `ACCOUNTS_UNIFIED_STORAGE`;
       const GLOBAL_CONFIG_KEY = `AUTO_UPDATE_CFG_GLOBAL`;
@@ -194,6 +217,8 @@ const TEMPLATES = {
       const now = Date.now();
       const lastCheck = config.lastCheck || 0;
       const intervalMs = (parseInt(config.interval) || 30) * 60 * 1000;
+      // 读取自动混淆配置
+      const autoObfuscate = !!config.obfuscate; 
   
       if (now - lastCheck <= intervalMs) return;
       
@@ -209,9 +234,11 @@ const TEMPLATES = {
               const stat = statsData.find(s => s.alias === acc.alias);
               if (!stat || stat.error) continue;
               const limit = stat.max || 100000;
+              // [熔断触发] 超过阈值
               if ((stat.total / limit) * 100 >= fuseThreshold) {
-                  await rotateUUIDAndDeploy(env, 'cmliu', accounts, ACCOUNTS_KEY);
-                  await rotateUUIDAndDeploy(env, 'joey', accounts, ACCOUNTS_KEY);
+                  // 强制携带 obfuscate 参数进行部署
+                  await rotateUUIDAndDeploy(env, 'cmliu', accounts, ACCOUNTS_KEY, autoObfuscate);
+                  await rotateUUIDAndDeploy(env, 'joey', accounts, ACCOUNTS_KEY, autoObfuscate);
                   actionTaken = true;
                   break; 
               }
@@ -219,9 +246,10 @@ const TEMPLATES = {
       }
   
       if (!actionTaken) {
+          // [自动更新] 携带混淆参数
           await Promise.all([
-              checkAndDeployUpdate(env, 'cmliu', accounts, ACCOUNTS_KEY),
-              checkAndDeployUpdate(env, 'joey', accounts, ACCOUNTS_KEY)
+              checkAndDeployUpdate(env, 'cmliu', accounts, ACCOUNTS_KEY, autoObfuscate),
+              checkAndDeployUpdate(env, 'joey', accounts, ACCOUNTS_KEY, autoObfuscate)
           ]);
       }
   
@@ -229,7 +257,7 @@ const TEMPLATES = {
       await env.CONFIG_KV.put(GLOBAL_CONFIG_KEY, JSON.stringify(config));
   }
   
-  async function checkAndDeployUpdate(env, type, accounts, accountsKey) {
+  async function checkAndDeployUpdate(env, type, accounts, accountsKey, doObfuscate) {
       try {
           const deployConfig = JSON.parse(await env.CONFIG_KV.get(`DEPLOY_CONFIG_${type}`) || '{"mode":"latest"}');
           if (deployConfig.mode === 'fixed') return; 
@@ -240,12 +268,13 @@ const TEMPLATES = {
           if (checkData.remote && (!checkData.local || checkData.remote.sha !== checkData.local.sha)) {
               const varsStr = await env.CONFIG_KV.get(`VARS_${type}`);
               const variables = varsStr ? JSON.parse(varsStr) : [];
-              await coreDeployLogic(env, type, variables, [], accountsKey, 'latest');
+              // 传入 doObfuscate
+              await coreDeployLogic(env, type, variables, [], accountsKey, 'latest', doObfuscate);
           }
       } catch(e) { console.error(`[Update Error] ${type}: ${e.message}`); }
   }
   
-  async function rotateUUIDAndDeploy(env, type, accounts, accountsKey) {
+  async function rotateUUIDAndDeploy(env, type, accounts, accountsKey, doObfuscate) {
       const VARS_KEY = `VARS_${type}`;
       const varsStr = await env.CONFIG_KV.get(VARS_KEY);
       let variables = varsStr ? JSON.parse(varsStr) : [];
@@ -262,17 +291,26 @@ const TEMPLATES = {
   
       const deployConfig = JSON.parse(await env.CONFIG_KV.get(`DEPLOY_CONFIG_${type}`) || '{"mode":"latest"}');
       const targetSha = deployConfig.mode === 'fixed' ? deployConfig.currentSha : 'latest';
-      await coreDeployLogic(env, type, variables, [], accountsKey, targetSha);
+      // 传入 doObfuscate
+      await coreDeployLogic(env, type, variables, [], accountsKey, targetSha, doObfuscate);
+  }
+
+  async function handleGetCode(env, type) {
+      try {
+          const { scriptUrl } = getGithubUrls(type);
+          const res = await fetch(scriptUrl);
+          if (!res.ok) throw new Error("Fetch failed: " + res.status);
+          const code = await res.text();
+          return new Response(JSON.stringify({ success: true, code: code }), { headers: { "Content-Type": "application/json" } });
+      } catch(e) { return new Response(JSON.stringify({ success: false, msg: e.message }), { status: 500 }); }
   }
   
   async function handleCheckUpdate(env, type, mode, limit = 10) {
       try {
           const DEPLOY_CONFIG_KEY = `DEPLOY_CONFIG_${type}`;
           const deployConfig = JSON.parse(await env.CONFIG_KV.get(DEPLOY_CONFIG_KEY) || '{"mode":"latest"}');
-          
           const localSha = deployConfig.currentSha;
           const localTime = deployConfig.deployTime;
-
           const { apiUrl, branch } = getGithubUrls(type);
           
           let fetchUrl = apiUrl + (mode === 'history' ? `?sha=${branch}&per_page=${limit}` : `?sha=${branch}&per_page=1`);
@@ -286,7 +324,6 @@ const TEMPLATES = {
           if (mode === 'history') return new Response(JSON.stringify({ history: ghData }), { headers: { "Content-Type": "application/json" } });
   
           const latestCommit = Array.isArray(ghData) ? ghData[0] : ghData;
-          
           let localCommitInfo = null;
           if (localSha) {
              if (localSha === latestCommit.sha) {
@@ -306,27 +343,34 @@ const TEMPLATES = {
   }
   
   async function handleManualDeploy(env, type, variables, deletedVariables, accountsKey, targetSha) {
+      // 手动部署时暂不自动应用服务器端混淆，依赖前端传参
       const result = await coreDeployLogic(env, type, variables, deletedVariables, accountsKey, targetSha);
       return new Response(JSON.stringify(result), { headers: { "Content-Type": "application/json" } });
   }
 
-  // ================= 批量部署逻辑 (增强版) =================
   async function handleBatchDeploy(env, reqData, accountsKey) {
-    const { template, workerName, kvName, config, targetAccounts, disableWorkersDev, customDomainPrefix, enableKV } = reqData;
+    const { template, workerName, kvName, config, targetAccounts, disableWorkersDev, customDomainPrefix, enableKV, customCode } = reqData;
     const allAccounts = JSON.parse(await env.CONFIG_KV.get(accountsKey) || "[]");
     
     const accountsToDeploy = allAccounts.filter(a => targetAccounts.includes(a.alias));
     if (accountsToDeploy.length === 0) return new Response(JSON.stringify([{name:"错误", success:false, msg:"未选择有效账号"}]), {headers:{"Content-Type":"application/json"}});
 
-    const { scriptUrl } = getGithubUrls(template);
     let scriptContent = "";
-    try {
-        const codeRes = await fetch(scriptUrl);
-        if(!codeRes.ok) throw new Error("代码拉取失败");
-        scriptContent = await codeRes.text();
-        if (template === 'joey') scriptContent = 'var window = globalThis;\n' + scriptContent;
-    } catch(e) {
-        return new Response(JSON.stringify([{name:"网络错误", success:false, msg:e.message}]), {headers:{"Content-Type":"application/json"}});
+    if (customCode) {
+        scriptContent = customCode; 
+        if (!scriptContent.includes('var window = globalThis') && !scriptContent.includes('import ')) {
+             scriptContent = 'var window = globalThis;\n' + scriptContent;
+        }
+    } else {
+        const { scriptUrl } = getGithubUrls(template);
+        try {
+            const codeRes = await fetch(scriptUrl);
+            if(!codeRes.ok) throw new Error("代码拉取失败");
+            scriptContent = await codeRes.text();
+            if (template === 'joey') scriptContent = 'var window = globalThis;\n' + scriptContent;
+        } catch(e) {
+            return new Response(JSON.stringify([{name:"网络错误", success:false, msg:e.message}]), {headers:{"Content-Type":"application/json"}});
+        }
     }
 
     const logs = [];
@@ -343,10 +387,7 @@ const TEMPLATES = {
                 if (!nsListRes.ok) throw new Error("无法读取KV列表");
                 const nsList = (await nsListRes.json()).result;
                 const existNs = nsList.find(n => n.title === kvName);
-                
-                if (existNs) {
-                    nsId = existNs.id;
-                } else {
+                if (existNs) { nsId = existNs.id; } else {
                     const createNsRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${acc.accountId}/storage/kv/namespaces`, {
                         method: 'POST', headers: jsonHeaders, body: JSON.stringify({title: kvName})
                     });
@@ -388,7 +429,6 @@ const TEMPLATES = {
             if (deployRes.ok) {
                 log.success = true;
                 let msgs = [];
-
                 if (customDomainPrefix && acc.defaultZoneId && acc.defaultZoneName) {
                     const hostname = `${customDomainPrefix}.${acc.defaultZoneName}`;
                     const domainRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${acc.accountId}/workers/domains`, {
@@ -398,7 +438,6 @@ const TEMPLATES = {
                     if (domainRes.ok) msgs.push(`✅ 绑定: https://${hostname}`);
                     else msgs.push(`⚠️ 域名绑定失败`);
                 }
-
                 if (disableWorkersDev) {
                     await fetch(`https://api.cloudflare.com/client/v4/accounts/${acc.accountId}/workers/scripts/${workerName}/subdomain`, {
                         method: "POST", headers: jsonHeaders, body: JSON.stringify({ enabled: false })
@@ -412,9 +451,7 @@ const TEMPLATES = {
                     const prefix = (await subRes.json()).result?.subdomain || "unknown";
                     msgs.push(`✅ 默认: https://${workerName}.${prefix}.workers.dev`);
                 }
-
                 log.msg = msgs.join(" | ");
-
                 if (!acc[`workers_${template}`]) acc[`workers_${template}`] = [];
                 if (!acc[`workers_${template}`].includes(workerName)) {
                     acc[`workers_${template}`].push(workerName);
@@ -423,7 +460,6 @@ const TEMPLATES = {
             } else {
                 log.msg = `❌ ${(await deployRes.json()).errors?.[0]?.message}`;
             }
-
         } catch(e) { log.msg = `❌ ${e.message}`; }
         logs.push(log);
     }
@@ -435,11 +471,11 @@ const TEMPLATES = {
         });
         await env.CONFIG_KV.put(accountsKey, JSON.stringify(finalAccounts));
     }
-
     return new Response(JSON.stringify(logs), { headers: { "Content-Type": "application/json" } });
   }
 
-  async function coreDeployLogic(env, type, variables, deletedVariables, accountsKey, targetSha) {
+  // 核心部署逻辑 (支持服务器端混淆)
+  async function coreDeployLogic(env, type, variables, deletedVariables, accountsKey, targetSha, enableServerObfuscate = false) {
       try {
           const accounts = JSON.parse(await env.CONFIG_KV.get(accountsKey) || "[]");
           if (accounts.length === 0) return [{ name: "提示", success: false, msg: "无账号配置" }];
@@ -447,7 +483,6 @@ const TEMPLATES = {
           const { scriptUrl, apiUrl } = getGithubUrls(type, targetSha);
           let githubScriptContent = "";
           let deployedSha = targetSha;
-          let remoteCommitDate = null;
           
           try {
               const codeRes = await fetch(scriptUrl + `?t=${Date.now()}`);
@@ -461,7 +496,6 @@ const TEMPLATES = {
                   if (apiRes.ok) {
                       const commitData = (await apiRes.json())[0];
                       deployedSha = commitData.sha;
-                      remoteCommitDate = commitData.commit.committer.date;
                   }
               }
           } catch (e) { return [{ name: "网络错误", success: false, msg: e.message }]; }
@@ -472,6 +506,11 @@ const TEMPLATES = {
              const targetIP = proxyVar && proxyVar.value ? proxyVar.value.trim() : 'ProxyIP.CMLiussss.net';
              const regex = /const\s+CF_FALLBACK_IPS\s*=\s*\[.*?\];/s;
              githubScriptContent = githubScriptContent.replace(regex, `const CF_FALLBACK_IPS = ['${targetIP}'];`);
+          }
+
+          // [核心] 如果是自动部署/熔断，且启用了混淆，则执行服务器端混淆
+          if (enableServerObfuscate) {
+              githubScriptContent = serverSideObfuscate(githubScriptContent);
           }
   
           const logs = [];
@@ -507,7 +546,7 @@ const TEMPLATES = {
                   
                   if (updateRes.ok) { 
                       logItem.success = true; 
-                      logItem.msg = `✅ Ver: ${deployedSha ? deployedSha.substring(0,7) : 'Unknown'}`; 
+                      logItem.msg = `✅ Ver: ${deployedSha ? deployedSha.substring(0,7) : 'Unknown'}${enableServerObfuscate ? ' (Obfuscated)' : ''}`; 
                   } else { 
                       logItem.msg = `❌ ${(await updateRes.json()).errors?.[0]?.message}`; 
                   }
@@ -596,7 +635,6 @@ const TEMPLATES = {
       } catch (e) { return new Response(JSON.stringify({ success: false, msg: e.message }), { status: 500 }); }
   }
 
-  // [修复] 删除 Worker 时同步移除本地配置
   async function handleDeleteWorker(env, accountId, email, key, workerName, deleteKv) {
       try {
           const headers = getAuthHeaders(email, key);
@@ -615,7 +653,6 @@ const TEMPLATES = {
           });
           
           if (delWorkerRes.ok) {
-               // [同步逻辑] 从 KV 中移除该 Worker 记录
                const ACCOUNTS_KEY = `ACCOUNTS_UNIFIED_STORAGE`;
                const accounts = JSON.parse(await env.CONFIG_KV.get(ACCOUNTS_KEY) || "[]");
                let updated = false;
@@ -634,7 +671,6 @@ const TEMPLATES = {
                if (updated) {
                    await env.CONFIG_KV.put(ACCOUNTS_KEY, JSON.stringify(accounts));
                }
-               // [结束同步]
 
                if (deleteKv && kvNamespaceIds.length > 0) {
                    await new Promise(r => setTimeout(r, 1000)); 
@@ -655,7 +691,7 @@ const TEMPLATES = {
   function loginHtml() { return `<!DOCTYPE html><html><body style="display:flex;justify-content:center;align-items:center;height:100vh;background:#f3f4f6"><form method="GET"><input type="password" name="code" placeholder="密码" style="padding:10px"><button style="padding:10px">登录</button></form></body></html>`; }
   
   // ==========================================
-  // 2. 前端页面
+  // 2. 前端页面 (完整 HTML)
   // ==========================================
   function mainHtml() {
     return `
@@ -665,9 +701,10 @@ const TEMPLATES = {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <link rel="manifest" href="/manifest.json">
-    <title>Worker 智能中控 (V9.9.1 Pro)</title>
+    <title>Worker 智能中控 (V9.9.6)</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
+    <script src="https://cdn.jsdelivr.net/npm/javascript-obfuscator/dist/index.browser.js"></script>
     <style>
       .input-field { border: 1px solid #cbd5e1; padding: 0.25rem 0.5rem; width:100%; border-radius: 4px; font-size: 0.8rem; } 
       .input-field:focus { border-color:#3b82f6; outline:none; }
@@ -686,8 +723,8 @@ const TEMPLATES = {
       
       <header class="bg-white px-4 py-3 md:px-6 md:py-4 rounded shadow flex flex-col lg:flex-row justify-between items-start lg:items-center gap-4">
           <div class="flex-none">
-              <h1 class="text-xl font-bold text-slate-800 flex items-center gap-2">🚀 Worker 部署中控 <span class="text-xs bg-purple-600 text-white px-2 py-0.5 rounded ml-2">V9.9.1 Pro</span></h1>
-              <div class="text-[10px] text-gray-400 mt-1">本地同步修复 · KV 开关 · 安全删除</div>
+              <h1 class="text-xl font-bold text-slate-800 flex items-center gap-2">🚀 Worker 部署中控 <span class="text-xs bg-purple-600 text-white px-2 py-0.5 rounded ml-2">V9.9.6</span></h1>
+              <div class="text-[10px] text-gray-400 mt-1">熔断混淆 · 收藏管理 · 全量修复</div>
           </div>
           <div id="logs" class="bg-slate-900 text-green-400 p-2 rounded text-xs font-mono hidden max-h-[80px] lg:max-h-[50px] overflow-y-auto shadow-inner w-full lg:flex-1 lg:mx-4 order-2 lg:order-none"></div>
           
@@ -696,11 +733,15 @@ const TEMPLATES = {
                <div class="w-px h-4 bg-gray-300 mx-1"></div>
                
                <div class="flex items-center gap-1">
-                  <span>自动更新:</span>
+                  <span>自动:</span>
                   <div class="relative inline-block w-8 align-middle select-none">
                       <input type="checkbox" id="auto_update_toggle" class="toggle-checkbox absolute block w-4 h-4 rounded-full bg-white border-4 appearance-none cursor-pointer border-gray-300"/>
                       <label for="auto_update_toggle" class="toggle-label block overflow-hidden h-4 rounded-full bg-gray-300 cursor-pointer"></label>
                   </div>
+               </div>
+               <div class="flex items-center gap-1">
+                  <span>自动混淆:</span>
+                  <input type="checkbox" id="auto_obfuscate_toggle" class="w-4 h-4 text-purple-600 border-gray-300 rounded"/>
                </div>
                <div class="flex items-center gap-1">
                   <input type="number" id="auto_update_interval" value="30" class="w-8 text-center border rounded py-0.5"><span>分</span>
@@ -826,9 +867,9 @@ const TEMPLATES = {
     </div>
 
     <div id="batch_deploy_modal" class="hidden fixed inset-0 bg-black bg-opacity-60 flex justify-center items-center z-50">
-        <div class="bg-white rounded-lg w-[500px] shadow-2xl overflow-hidden animate-fade-in">
+        <div class="bg-white rounded-lg w-[600px] shadow-2xl overflow-hidden animate-fade-in">
             <div class="bg-indigo-600 p-3 flex justify-between items-center text-white">
-                <h3 class="font-bold text-sm">✨ 批量新建部署</h3>
+                <h3 class="font-bold text-sm">✨ 批量部署 (Obfuscator Pro)</h3>
                 <button onclick="document.getElementById('batch_deploy_modal').classList.add('hidden')" class="hover:text-gray-200">×</button>
             </div>
             <div class="p-4 text-xs space-y-3">
@@ -839,18 +880,31 @@ const TEMPLATES = {
                 
                 <div class="grid grid-cols-2 gap-3 items-end">
                     <div><label class="block text-gray-500 mb-1">KV 空间名称</label><input id="bd_kv_name" class="input-field" placeholder="自动创建/使用同名 KV"></div>
-                    <div class="flex items-center gap-2 pb-2">
-                         <input type="checkbox" id="bd_enable_kv" class="w-4 h-4 text-indigo-600 border-gray-300 rounded focus:ring-indigo-500" checked>
-                         <label for="bd_enable_kv" class="font-bold text-gray-700 cursor-pointer">绑定 KV 存储</label>
+                    <div class="flex flex-col gap-2 pb-1">
+                         <div class="flex items-center gap-2">
+                            <input type="checkbox" id="bd_enable_kv" class="w-4 h-4 text-indigo-600 border-gray-300 rounded" checked>
+                            <label for="bd_enable_kv" class="font-bold text-gray-700">绑定 KV 存储</label>
+                         </div>
+                         <div class="flex items-center gap-2">
+                            <input type="checkbox" id="bd_obfuscate" class="w-4 h-4 text-red-600 border-gray-300 rounded" onchange="toggleObfuscatePanel()">
+                            <label for="bd_obfuscate" class="font-bold text-red-600">⚡ 启用代码混淆 (前端)</label>
+                         </div>
                     </div>
                 </div>
                 
+                <div id="obfuscate_panel" class="hidden bg-gray-800 text-green-400 p-2 rounded text-[10px] font-mono border border-gray-600">
+                    <div class="flex justify-between items-center mb-1">
+                        <span>自定义混淆代码 (留空则自动拉取并混淆):</span>
+                        <button onclick="document.getElementById('bd_custom_code').value=''" class="text-gray-400 hover:text-white">清空</button>
+                    </div>
+                    <textarea id="bd_custom_code" class="w-full h-24 bg-gray-900 border-0 p-1 text-xs focus:ring-0" placeholder="// 在此粘贴 obfuscator.io 的结果，或者保持空白由系统自动混淆..."></textarea>
+                </div>
+
                 <div class="bg-slate-50 p-2 rounded border">
                     <div class="flex items-center gap-2 mb-2">
                          <input type="checkbox" id="bd_disable_workers_dev" class="w-4 h-4 text-indigo-600 border-gray-300 rounded focus:ring-indigo-500">
                          <label for="bd_disable_workers_dev" class="font-bold text-gray-700">🚫 禁用默认 *.workers.dev 域名</label>
                     </div>
-
                     <div class="border-t pt-2">
                         <label class="block text-purple-700 font-bold mb-1">🌐 自定义域名 (自动绑定)</label>
                         <div class="flex gap-1 items-center">
@@ -858,7 +912,6 @@ const TEMPLATES = {
                             <span class="text-gray-400">.</span>
                             <span class="text-gray-500 text-xs italic">[使用账号预设域名]</span>
                         </div>
-                        <p class="text-[9px] text-gray-400 mt-1">* 仅当账号已配置"预设域名"时生效。</p>
                     </div>
                 </div>
 
@@ -908,22 +961,32 @@ const TEMPLATES = {
         <div class="bg-white rounded-lg w-[450px] shadow-xl max-h-[85vh] flex flex-col overflow-hidden">
             <div class="p-3 border-b bg-gray-50 flex justify-between items-center">
                 <h3 class="text-sm font-bold text-gray-700">📜 版本管理</h3>
-                <button onclick="document.getElementById('history_modal').classList.add('hidden')" class="text-gray-400 hover:text-gray-600 text-lg">×</button>
-            </div>
-            <div class="bg-gray-50 p-2 border-b flex justify-between items-center text-xs">
-                <span>显示条数:</span>
-                <input type="number" id="history_limit_input" value="10" class="w-12 text-center border rounded" onchange="refreshHistory()">
-            </div>
-            <div class="flex-1 overflow-y-auto bg-slate-50 p-2 space-y-3">
-                <div id="fav_section" class="hidden">
-                    <div class="text-[10px] font-bold text-orange-600 uppercase tracking-wider mb-1 px-1">⭐ 收藏夹 (Favorites)</div>
-                    <div id="fav_list" class="space-y-1"></div>
+                <div class="flex gap-2">
+                    <button onclick="openFavoritesPanel()" class="text-xs bg-orange-100 text-orange-600 px-2 py-1 rounded font-bold border border-orange-200 hover:bg-orange-200">⭐ 查看收藏</button>
+                    <button onclick="document.getElementById('history_modal').classList.add('hidden')" class="text-gray-400 hover:text-gray-600 text-lg">×</button>
                 </div>
-                <div>
-                    <div class="flex justify-between items-end px-1 mb-1">
-                        <div class="text-[10px] font-bold text-gray-500 uppercase tracking-wider">🕒 最近提交</div>
+            </div>
+            
+            <div id="fav_panel_view" class="hidden flex-col h-full bg-orange-50">
+                <div class="p-2 border-b border-orange-200 flex justify-between items-center">
+                    <span class="text-xs font-bold text-orange-800">⭐ 我的收藏版本</span>
+                    <button onclick="closeFavoritesPanel()" class="text-[10px] bg-white border px-2 py-0.5 rounded">返回历史</button>
+                </div>
+                <div id="fav_full_list" class="flex-1 overflow-y-auto p-2 space-y-1"></div>
+            </div>
+
+            <div id="history_panel_view" class="flex flex-col h-full">
+                <div class="bg-gray-50 p-2 border-b flex justify-between items-center text-xs">
+                    <span>显示条数:</span>
+                    <input type="number" id="history_limit_input" value="10" class="w-12 text-center border rounded" onchange="refreshHistory()">
+                </div>
+                <div class="flex-1 overflow-y-auto bg-slate-50 p-2 space-y-3">
+                    <div>
+                        <div class="flex justify-between items-end px-1 mb-1">
+                            <div class="text-[10px] font-bold text-gray-500 uppercase tracking-wider">🕒 最近提交</div>
+                        </div>
+                        <div id="history_list" class="space-y-1 min-h-[100px]"></div>
                     </div>
-                    <div id="history_list" class="space-y-1 min-h-[100px]"></div>
                 </div>
             </div>
         </div>
@@ -944,7 +1007,6 @@ const TEMPLATES = {
         'ech': { defaultVars: ["PROXYIP"], uuidField: "", name: "ECH" } 
       };
       
-      // [全量 ProxyIP] 完整列表
       const ECH_PROXIES = [
           {group:"Global", list:["ProxyIP.CMLiussss.net", "ProxyIP.Aliyun.CMLiussss.net", "ProxyIP.Oracle.CMLiussss.net"]},
           {group:"HK (香港)", list:["ProxyIP.HK.CMLiussss.net", "ProxyIP.Aliyun.HK.CMLiussss.net", "ProxyIP.Oracle.HK.CMLiussss.net"]},
@@ -1004,6 +1066,121 @@ const TEMPLATES = {
           }
       }
 
+      // 批量部署逻辑（核心：包含混淆与 RuntimeFix）
+      async function doBatchDeploy() {
+          const btn = document.getElementById('btn_do_batch');
+          const t = document.getElementById('bd_template').value;
+          const name = document.getElementById('bd_name').value;
+          const kvName = document.getElementById('bd_kv_name').value;
+          const enableKV = document.getElementById('bd_enable_kv').checked;
+          const enableObfuscate = document.getElementById('bd_obfuscate').checked;
+          let customCode = document.getElementById('bd_custom_code').value;
+
+          if (!name) return Swal.fire('提示', 'Worker名称必填', 'warning');
+          if (enableKV && !kvName) return Swal.fire('提示', '开启 KV 绑定时必须填写 KV 名称', 'warning');
+          
+          btn.disabled = true;
+          btn.innerText = "⏳ 准备中...";
+          const logBox = document.getElementById('logs');
+          logBox.classList.remove('hidden');
+          
+          try {
+             if (enableObfuscate && !customCode.trim()) {
+                 logBox.innerHTML = '<div class="text-yellow-300">⚡ 1. Fetching Code...</div>';
+                 const r = await fetch(\`/api/get_code?type=\${t}\`);
+                 const d = await r.json();
+                 if(!d.success) throw new Error(d.msg);
+                 
+                 let sourceCode = d.code;
+                 
+                 // [智能注入 window polyfill]
+                 if (sourceCode.includes('import ') || sourceCode.includes('export ')) {
+                     logBox.innerHTML += '<div class="text-blue-300">💉 2. Injecting Polyfill (Module Mode)...</div>';
+                     const lines = sourceCode.split('\\n');
+                     let lastImportIndex = -1;
+                     lines.forEach((line, index) => {
+                         if (line.trim().startsWith('import ')) lastImportIndex = index;
+                     });
+                     if (lastImportIndex !== -1) {
+                         lines.splice(lastImportIndex + 1, 0, 'var window = globalThis;');
+                         sourceCode = lines.join('\\n');
+                     } else {
+                         sourceCode = 'var window = globalThis;\\n' + sourceCode;
+                     }
+                 } else {
+                     sourceCode = 'var window = globalThis;\\n' + sourceCode;
+                 }
+
+                 logBox.innerHTML += '<div class="text-purple-300">🔒 3. Obfuscating (High Compatibility)...</div>';
+                 
+                 // [V9.9.5 修复] 禁用控制台拦截，确保兼容 Worker 环境
+                 const obfuscationResult = JavaScriptObfuscator.obfuscate(sourceCode, {
+                    target: 'service-worker', 
+                    compact: true,
+                    controlFlowFlattening: true,
+                    controlFlowFlatteningThreshold: 0.75,
+                    deadCodeInjection: true,
+                    deadCodeInjectionThreshold: 0.4,
+                    debugProtection: false,   
+                    disableConsoleOutput: false, 
+                    identifierNamesGenerator: 'hexadecimal',
+                    log: false,
+                    renameGlobals: false,
+                    rotateStringArray: true,
+                    selfDefending: false,     
+                    stringArray: true,
+                    stringArrayEncoding: ['base64', 'rc4'],
+                    stringArrayThreshold: 0.75,
+                    unicodeEscapeSequence: false
+                });
+                customCode = obfuscationResult.getObfuscatedCode();
+                logBox.innerHTML += '<div class="text-green-300">✅ Obfuscation Complete!</div>';
+             }
+
+             btn.innerText = "🚀 部署中...";
+             const chks = document.querySelectorAll('.bd-acc-chk:checked');
+             if(chks.length===0) throw new Error("至少选择一个账号");
+             const targetAccounts = Array.from(chks).map(c => c.value);
+             const config = {};
+             if (t === 'cmliu') {
+                  config.admin = document.getElementById('bd_admin_pass').value;
+                  config.uuid = document.getElementById('bd_uuid').value; 
+             } else {
+                  config.uuid = document.getElementById('bd_uuid').value;
+             }
+
+             const res = await fetch('/api/batch_deploy', {
+                  method: 'POST',
+                  body: JSON.stringify({ 
+                      template: t, 
+                      workerName: name, 
+                      kvName: kvName, 
+                      config: config, 
+                      targetAccounts: targetAccounts,
+                      disableWorkersDev: document.getElementById('bd_disable_workers_dev').checked,
+                      customDomainPrefix: document.getElementById('bd_domain_prefix').value,
+                      enableKV: enableKV,
+                      customCode: customCode 
+                  })
+              });
+              const logs = await res.json();
+              logBox.innerHTML = logs.map(l => {
+                  if (l.success && l.msg.startsWith('✅')) return \`<div>✅ <span class="text-white">\${l.msg.replace('✅ ', '')}</span></div>\`;
+                  return \`<div>[\${l.success ? 'OK' : 'ERR'}] \${l.name}: <span class="text-gray-400">\${l.msg}</span></div>\`;
+              }).join('');
+              
+              document.getElementById('batch_deploy_modal').classList.add('hidden');
+              await loadAccounts(); 
+              Swal.fire('完成', '操作完成，请查看日志', 'success');
+
+          } catch(e) { 
+              Swal.fire('错误', '部署失败: ' + e.message, 'error'); 
+              logBox.innerHTML += \`<div class="text-red-500">❌ Error: \${e.message}</div>\`;
+          }
+          btn.disabled = false;
+          btn.innerText = "🚀 开始部署";
+      }
+
       function openBatchDeployModal() {
           const m = document.getElementById('batch_deploy_modal');
           const list = document.getElementById('bd_account_list');
@@ -1023,76 +1200,13 @@ const TEMPLATES = {
           const t = document.getElementById('bd_template').value;
           document.getElementById('bd_config_cmliu').classList.toggle('hidden', t !== 'cmliu');
           document.getElementById('bd_config_joey').classList.toggle('hidden', t !== 'joey');
-          
           const kvCheck = document.getElementById('bd_enable_kv');
-          if (t === 'joey') {
-              kvCheck.checked = false; 
-          } else {
-              kvCheck.checked = true;  
-          }
+          if (t === 'joey') kvCheck.checked = false; else kvCheck.checked = true;
       }
 
-      async function doBatchDeploy() {
-          const btn = document.getElementById('btn_do_batch');
-          const t = document.getElementById('bd_template').value;
-          const name = document.getElementById('bd_name').value;
-          const kvName = document.getElementById('bd_kv_name').value;
-          const enableKV = document.getElementById('bd_enable_kv').checked;
-          
-          if (!name) return Swal.fire('提示', 'Worker名称必填', 'warning');
-          if (enableKV && !kvName) return Swal.fire('提示', '开启 KV 绑定时必须填写 KV 名称', 'warning');
-          
-          const chks = document.querySelectorAll('.bd-acc-chk:checked');
-          if (chks.length === 0) return Swal.fire('提示', '请至少选择一个账号', 'warning');
-          
-          const targetAccounts = Array.from(chks).map(c => c.value);
-          const config = {};
-          if (t === 'cmliu') {
-              config.admin = document.getElementById('bd_admin_pass').value;
-              if (!config.admin) return Swal.fire('提示', 'CMliu 必须设置 ADMIN 密码', 'warning');
-              config.uuid = document.getElementById('bd_uuid').value;
-          } else {
-              config.uuid = document.getElementById('bd_uuid').value;
-              if (!config.uuid) return Swal.fire('提示', 'Joey 必须设置 UUID', 'warning');
-          }
-
-          const disableWorkersDev = document.getElementById('bd_disable_workers_dev').checked;
-          const customDomainPrefix = document.getElementById('bd_domain_prefix').value;
-
-          btn.disabled = true;
-          btn.innerText = "⏳ 部署中...";
-          const logBox = document.getElementById('logs');
-          logBox.classList.remove('hidden');
-          logBox.innerHTML = '<div class="text-indigo-300">⚡ Initializing Batch Deploy...</div>';
-
-          try {
-              const res = await fetch('/api/batch_deploy', {
-                  method: 'POST',
-                  body: JSON.stringify({ 
-                      template: t, 
-                      workerName: name, 
-                      kvName: kvName, 
-                      config: config, 
-                      targetAccounts: targetAccounts,
-                      disableWorkersDev: disableWorkersDev,
-                      customDomainPrefix: customDomainPrefix,
-                      enableKV: enableKV 
-                  })
-              });
-              const logs = await res.json();
-              logBox.innerHTML = logs.map(l => {
-                  if (l.success && l.msg.startsWith('✅')) {
-                      return \`<div>✅ <span class="text-white">\${l.msg.replace('✅ ', '')}</span></div>\`;
-                  }
-                  return \`<div>[\${l.success ? 'OK' : 'ERR'}] \${l.name}: <span class="text-gray-400">\${l.msg}</span></div>\`;
-              }).join('');
-              
-              document.getElementById('batch_deploy_modal').classList.add('hidden');
-              await loadAccounts(); 
-              Swal.fire('完成', '批量操作完成，请查看顶部日志', 'success');
-          } catch(e) { Swal.fire('错误', '请求失败: ' + e.message, 'error'); }
-          btn.disabled = false;
-          btn.innerText = "🚀 开始部署";
+      function toggleObfuscatePanel() {
+          const chk = document.getElementById('bd_obfuscate').checked;
+          document.getElementById('obfuscate_panel').classList.toggle('hidden', !chk);
       }
 
       async function openAccountManage(i) {
@@ -1180,7 +1294,6 @@ const TEMPLATES = {
 
           if (result.isConfirmed) {
               Swal.fire('已删除', 'Worker 及相关资源已清理', 'success');
-              // 删除后立刻刷新账号列表，清除已删除的项目名
               await loadAccounts(); 
               openAccountManage(accIndex);
           }
@@ -1297,8 +1410,10 @@ const TEMPLATES = {
       function addVarRow(t,k='',v=''){ const c=document.getElementById(\`vars_\${t}\`); const d=document.createElement('div'); d.className=\`flex gap-1 items-center mb-1 var-row-\${t}\`; let h=''; if(t==='cmliu'&&(k==='PROXYIP'||k==='DOH')){ const options=k==='DOH'?["https://dns.jhb.ovh/joeyblog","https://doh.cmliussss.com/CMLiussss","cloudflare-ech.com"]:ECH_PROXIES.flatMap(g=>g.list); h=\`<select onchange="this.previousElementSibling.value=this.value" class="w-4 border rounded text-[8px] bg-gray-50 cursor-pointer"><option>▼</option>\${options.map(u=>\`<option value="\${u.split(' ')[0]}">\${u}</option>\`).join('')}</select>\`; } d.innerHTML=\`<input class="input-field w-1/3 key font-bold" placeholder="Key" value="\${k}"><input class="input-field w-2/3 val" placeholder="Val" value="\${v}">\${h}<button onclick="removeVarRow(this,'\${t}')" class="text-gray-300 hover:text-red-500 px-1 font-bold">×</button>\`; c.appendChild(d); }
       function removeVarRow(b,t){ const k=b.parentElement.querySelector('.key').value; if(k)deletedVars[t].push(k); b.parentElement.remove(); }
       async function loadVars(t){ const c=document.getElementById(\`vars_\${t}\`); c.innerHTML='<div class="text-center text-gray-300">...</div>'; try{ const r=await fetch(\`/api/settings?type=\${t}\`); const v=await r.json(); const m=new Map(); if(Array.isArray(v))v.forEach(x=>m.set(x.key,x.value)); TEMPLATES[t].defaultVars.forEach(k=>{ if(!m.has(k))m.set(k,k===TEMPLATES[t].uuidField?crypto.randomUUID():'') }); c.innerHTML=''; deletedVars[t]=[]; m.forEach((val,key)=>addVarRow(t,key,val)); }catch(e){ c.innerHTML='Load Error'; } }
-      async function loadGlobalConfig(){ try{ const r=await fetch('/api/auto_config'); const c=await r.json(); document.getElementById('auto_update_toggle').checked=!!c.enabled; document.getElementById('auto_update_interval').value=c.interval||30; document.getElementById('fuse_threshold').value=c.fuseThreshold||0; }catch(e){} }
-      async function saveAutoConfig(){ await fetch('/api/auto_config',{method:'POST',body:JSON.stringify({enabled:document.getElementById('auto_update_toggle').checked,interval:document.getElementById('auto_update_interval').value,fuseThreshold:document.getElementById('fuse_threshold').value})}); alert('已保存配置'); }
+      
+      // Auto Config 包含混淆开关
+      async function loadGlobalConfig(){ try{ const r=await fetch('/api/auto_config'); const c=await r.json(); document.getElementById('auto_update_toggle').checked=!!c.enabled; document.getElementById('auto_obfuscate_toggle').checked=!!c.obfuscate; document.getElementById('auto_update_interval').value=c.interval||30; document.getElementById('fuse_threshold').value=c.fuseThreshold||0; }catch(e){} }
+      async function saveAutoConfig(){ await fetch('/api/auto_config',{method:'POST',body:JSON.stringify({enabled:document.getElementById('auto_update_toggle').checked, obfuscate:document.getElementById('auto_obfuscate_toggle').checked, interval:document.getElementById('auto_update_interval').value, fuseThreshold:document.getElementById('fuse_threshold').value})}); alert('已保存配置'); }
       
       async function checkUpdate(t){ 
           const e=document.getElementById(\`ver_\${t}\`); 
@@ -1335,37 +1450,64 @@ const TEMPLATES = {
       function refreshUUID(t){ const k=TEMPLATES[t].uuidField; if(k)document.querySelectorAll(\`.var-row-\${t}\`).forEach(r=>{ if(r.querySelector('.key').value===k){ const i=r.querySelector('.val'); i.value=crypto.randomUUID(); i.classList.add('bg-green-100'); setTimeout(()=>i.classList.remove('bg-green-100'),500); } }); }
       async function checkDeployConfig(t){ try{ const r=await fetch(\`/api/deploy_config?type=\${t}\`); const c=await r.json(); deployConfigs[t]=c; const b=document.getElementById(\`badge_\${t}\`); if(c.mode==='fixed'){ b.className="text-[9px] px-1.5 py-0.5 rounded text-white bg-orange-500 font-bold"; b.innerText="🔒 Locked"; }else{ b.className="text-[9px] px-1.5 py-0.5 rounded text-white bg-green-500"; b.innerText="Auto Update"; } }catch(e){} }
 
-      // 历史记录 & 收藏
+      // 历史记录 & 收藏 (新版逻辑)
       async function openVersionHistory(type){ currentHistoryType=type; refreshHistory(); }
       async function refreshHistory() {
           const type = currentHistoryType; if(!type) return;
           const limit = document.getElementById('history_limit_input').value || 10;
-          const modal=document.getElementById('history_modal');const hList=document.getElementById('history_list');const fList=document.getElementById('fav_list');const fSec=document.getElementById('fav_section');
+          const modal=document.getElementById('history_modal');const hList=document.getElementById('history_list');
           
           modal.classList.remove('hidden');
+          document.getElementById('fav_panel_view').classList.add('hidden');
+          document.getElementById('history_panel_view').classList.remove('hidden');
+
           hList.innerHTML='<div class="text-center text-gray-400 text-xs py-4">加载中...</div>';
-          fList.innerHTML=''; 
-          fSec.classList.add('hidden'); 
 
           try{
             const[histRes,favRes]=await Promise.all([fetch(\`/api/check_update?type=\${type}&mode=history&limit=\${limit}\`),fetch(\`/api/favorites?type=\${type}\`)]);
             const histData=await histRes.json();const favData=await favRes.json();
             
-            if(favData && Array.isArray(favData) && favData.length > 0){
-                fSec.classList.remove('hidden');
-                favData.forEach(item=>renderHistoryItem(type,item,fList,true));
-            }
+            // 收藏夹渲染逻辑移到 openFavoritesPanel
+            window.currentFavData = favData || [];
 
-            hList.innerHTML='';const latestBtn=document.createElement('div');latestBtn.className="bg-green-50 hover:bg-green-100 p-2 rounded border border-green-200 cursor-pointer transition mb-2";latestBtn.innerHTML=\`<div class="flex justify-between items-center"><span class="font-bold text-green-700 text-xs">⚡ Always Latest</span></div>\`;latestBtn.onclick=()=>{modal.classList.add('hidden');deploy(type,'latest');};hList.appendChild(latestBtn);
+            hList.innerHTML='';
+            const latestBtn=document.createElement('div');
+            latestBtn.className="bg-green-50 hover:bg-green-100 p-2 rounded border border-green-200 cursor-pointer transition mb-2";
+            latestBtn.innerHTML=\`<div class="flex justify-between items-center"><span class="font-bold text-green-700 text-xs">⚡ Always Latest (部署最新)</span></div>\`;
+            latestBtn.onclick=()=>{modal.classList.add('hidden');deploy(type,'latest');};
+            hList.appendChild(latestBtn);
             
             if(histData.history){
                 histData.history.forEach(commit=>{
                     const item={sha:commit.sha,date:commit.commit.committer.date,message:commit.commit.message};
-                    const isFav=favData&&favData.find(f=>f.sha===item.sha);
+                    const isFav=window.currentFavData.find(f=>f.sha===item.sha);
                     renderHistoryItem(type,item,hList,false,isFav);
                 });
             }
           }catch(e){hList.innerHTML='<div class="text-red-400 text-xs">网络错误: ' + e.message + '</div>';}
+      }
+
+      function openFavoritesPanel() {
+          document.getElementById('history_panel_view').classList.add('hidden');
+          const panel = document.getElementById('fav_panel_view');
+          const list = document.getElementById('fav_full_list');
+          panel.classList.remove('hidden');
+          panel.classList.add('flex');
+          list.innerHTML = '';
+          
+          if(window.currentFavData && window.currentFavData.length > 0) {
+              window.currentFavData.forEach(item => {
+                  renderHistoryItem(currentHistoryType, item, list, true, true);
+              });
+          } else {
+              list.innerHTML = '<div class="text-center text-gray-400 text-xs py-4">暂无收藏</div>';
+          }
+      }
+
+      function closeFavoritesPanel() {
+          document.getElementById('fav_panel_view').classList.add('hidden');
+          document.getElementById('fav_panel_view').classList.remove('flex');
+          document.getElementById('history_panel_view').classList.remove('hidden');
       }
       
       function renderHistoryItem(type,item,container,isFavSection,isFavInHist){
@@ -1378,7 +1520,10 @@ const TEMPLATES = {
           const starBtn=document.createElement('button');
           starBtn.className=\`text-sm focus:outline-none \${(isFavSection||isFavInHist)?'text-orange-400':'text-gray-300 hover:text-orange-400'}\`;
           starBtn.innerHTML=(isFavSection||isFavInHist)?'★':'☆';
-          starBtn.onclick=(e)=>{e.stopPropagation();toggleFavorite(type,item,isFavSection||isFavInHist);};
+          starBtn.onclick=(e)=>{
+              e.stopPropagation();
+              toggleFavorite(type,item,(isFavSection||isFavInHist));
+          };
           
           const content=document.createElement('div');
           content.className="flex-1 cursor-pointer overflow-hidden";
@@ -1390,7 +1535,15 @@ const TEMPLATES = {
       
       async function toggleFavorite(type,item,isRemove){
           await fetch('/api/favorites',{method:'POST',body:JSON.stringify({action:isRemove?'remove':'add',item:item,type:type})});
-          refreshHistory();
+          // 刷新数据
+          const r = await fetch(\`/api/favorites?type=\${type}\`);
+          window.currentFavData = await r.json();
+          // 如果在收藏面板，重新渲染收藏列表；如果在历史面板，刷新历史
+          if(!document.getElementById('fav_panel_view').classList.contains('hidden')) {
+              openFavoritesPanel();
+          } else {
+              refreshHistory();
+          }
       }
 
       init();
@@ -1398,4 +1551,3 @@ const TEMPLATES = {
   </body></html>
     `;
   }
-}
