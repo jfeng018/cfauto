@@ -1,5 +1,11 @@
 /**
- * Cloudflare Worker 多项目部署管理器 (V10.1.0 - Subdomain Management)
+ * Cloudflare Worker 多项目部署管理器 (V10.2.0 - Starfield Theme)
+ * 更新日志 (V10.2.0)：
+ * 1. [Feature] 新增暗黑星空模式 / 明亮模式主题切换。
+ * 2. [Feature] Canvas 动态星空背景（闪烁星星 + 流星 + 星云光晕）。
+ * 3. [Feature] 卡片毛玻璃半透明效果，全组件暗黑模式适配。
+ * 4. [Feature] 主题选择通过 localStorage 持久化。
+ *
  * 更新日志 (V10.1.0)：
  * 1. [Feature] 管理弹窗新增修改账号 workers.dev 子域名前缀功能。
  * 2. [Feature] 新增 /api/get_subdomain 和 /api/change_subdomain 后端 API。
@@ -792,11 +798,97 @@ function mainHtml() {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <link rel="manifest" href="/manifest.json">
-    <title>Worker 智能中控 (V10.1.0)</title>
+    <title>Worker 智能中控 (V10.2.0)</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
     <script src="https://cdn.jsdelivr.net/npm/javascript-obfuscator/dist/index.browser.js"></script>
     <style>
+      :root {
+        --bg-page: #f1f5f9; --bg-card: #ffffff; --bg-card-alt: #f8fafc; --bg-input: #ffffff;
+        --bg-header: #ffffff; --bg-toolbar: #f8fafc;
+        --text-primary: #1e293b; --text-secondary: #475569; --text-muted: #94a3b8;
+        --border-color: #e2e8f0; --border-light: #f1f5f9;
+        --shadow-color: rgba(0,0,0,0.08);
+        --table-header-bg: #f8fafc; --table-row-hover: #f8fafc;
+      }
+      [data-theme="dark"] {
+        --bg-page: transparent; --bg-card: rgba(15,23,42,0.75); --bg-card-alt: rgba(30,41,59,0.7); --bg-input: rgba(30,41,59,0.8);
+        --bg-header: rgba(15,23,42,0.8); --bg-toolbar: rgba(30,41,59,0.6);
+        --text-primary: #e2e8f0; --text-secondary: #cbd5e1; --text-muted: #94a3b8;
+        --border-color: rgba(71,85,105,0.5); --border-light: rgba(51,65,85,0.5);
+        --shadow-color: rgba(0,0,0,0.3);
+        --table-header-bg: rgba(30,41,59,0.8); --table-row-hover: rgba(51,65,85,0.4);
+      }
+      body { background: var(--bg-page); color: var(--text-primary); transition: background 0.4s, color 0.4s; }
+      [data-theme="dark"] body { background: transparent; }
+      #starfield { position: fixed; top: 0; left: 0; width: 100%; height: 100%; z-index: -1; background: #0f172a; display: none; }
+      [data-theme="dark"] #starfield { display: block; }
+      [data-theme="dark"] .bg-white, [data-theme="dark"] .project-card,
+      [data-theme="dark"] .bg-slate-100 {
+        background: var(--bg-card) !important; backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+        border: 1px solid var(--border-color) !important;
+      }
+      [data-theme="dark"] header, [data-theme="dark"] .bg-white.rounded.shadow {
+        background: var(--bg-header) !important; backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
+      }
+      [data-theme="dark"] .bg-slate-50, [data-theme="dark"] .bg-gray-50 {
+        background: var(--bg-card-alt) !important;
+      }
+      [data-theme="dark"] .text-slate-800, [data-theme="dark"] .text-gray-700,
+      [data-theme="dark"] .text-slate-700, [data-theme="dark"] .text-gray-600 {
+        color: var(--text-primary) !important;
+      }
+      [data-theme="dark"] .text-gray-500, [data-theme="dark"] .text-gray-400,
+      [data-theme="dark"] .text-gray-300 {
+        color: var(--text-muted) !important;
+      }
+      [data-theme="dark"] .border-slate-200, [data-theme="dark"] .border-gray-100,
+      [data-theme="dark"] .border-gray-200 {
+        border-color: var(--border-color) !important;
+      }
+      [data-theme="dark"] .input-field {
+        background: var(--bg-input) !important; color: var(--text-primary) !important;
+        border-color: var(--border-color) !important;
+      }
+      [data-theme="dark"] .input-field::placeholder { color: var(--text-muted) !important; }
+      [data-theme="dark"] .compact-table th { background: var(--table-header-bg) !important; color: var(--text-muted) !important; }
+      [data-theme="dark"] .compact-table td { border-bottom-color: var(--border-light) !important; color: var(--text-secondary) !important; }
+      [data-theme="dark"] .compact-table tr:hover { background: var(--table-row-hover) !important; }
+      [data-theme="dark"] .bg-red-50    { background: rgba(127,29,29,0.2) !important; }
+      [data-theme="dark"] .bg-blue-50   { background: rgba(30,58,138,0.2) !important; }
+      [data-theme="dark"] .bg-green-50  { background: rgba(20,83,45,0.2) !important; }
+      [data-theme="dark"] .bg-purple-50 { background: rgba(88,28,135,0.15) !important; }
+      [data-theme="dark"] .bg-orange-50 { background: rgba(124,45,18,0.2) !important; }
+      [data-theme="dark"] .bg-indigo-50 { background: rgba(49,46,129,0.2) !important; }
+      [data-theme="dark"] .border-red-100   { border-color: rgba(127,29,29,0.3) !important; }
+      [data-theme="dark"] .border-blue-100  { border-color: rgba(30,58,138,0.3) !important; }
+      [data-theme="dark"] .border-green-100 { border-color: rgba(20,83,45,0.3) !important; }
+      [data-theme="dark"] .border-purple-100 { border-color: rgba(88,28,135,0.3) !important; }
+      [data-theme="dark"] .border-orange-100,.border-orange-200 { border-color: rgba(124,45,18,0.3) !important; }
+      [data-theme="dark"] .border-indigo-100 { border-color: rgba(49,46,129,0.3) !important; }
+      [data-theme="dark"] select, [data-theme="dark"] input[type="number"],
+      [data-theme="dark"] input[type="text"], [data-theme="dark"] input[type="password"] {
+        background: var(--bg-input) !important; color: var(--text-primary) !important;
+        border-color: var(--border-color) !important;
+      }
+      [data-theme="dark"] .shadow { box-shadow: 0 2px 8px var(--shadow-color) !important; }
+      /* Modal dark overrides */
+      [data-theme="dark"] #batch_deploy_modal > div > div:first-child,
+      [data-theme="dark"] #account_manage_modal > div,
+      [data-theme="dark"] #history_modal > div > div,
+      [data-theme="dark"] #sync_select_modal > div {
+        background: rgba(15,23,42,0.95) !important; backdrop-filter: blur(20px);
+        border: 1px solid var(--border-color) !important;
+      }
+      [data-theme="dark"] #batch_deploy_modal .p-4,
+      [data-theme="dark"] #account_manage_modal .p-4 {
+        color: var(--text-primary);
+      }
+      /* Theme toggle button */
+      .theme-toggle { cursor: pointer; font-size: 18px; width: 36px; height: 36px; border-radius: 50%; border: 2px solid var(--border-color);
+        display: flex; align-items: center; justify-content: center; transition: all 0.3s; background: var(--bg-card); }
+      .theme-toggle:hover { transform: scale(1.1); box-shadow: 0 0 12px rgba(139,92,246,0.4); }
+      /* Original styles */
       .input-field { border: 1px solid #cbd5e1; padding: 0.25rem 0.5rem; width:100%; border-radius: 4px; font-size: 0.8rem; } 
       .input-field:focus { border-color:#3b82f6; outline:none; }
       .toggle-checkbox:checked { right: 0; border-color: #68D391; }
@@ -807,19 +899,23 @@ function mainHtml() {
       ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
       .animate-fade-in { animation: fadeIn 0.3s ease-out; }
       @keyframes fadeIn { from { opacity: 0; transform: translateY(-10px); } to { opacity: 1; transform: translateY(0); } }
+      @keyframes twinkle { 0%, 100% { opacity: 0.3; } 50% { opacity: 1; } }
     </style>
   </head>
   <body class="bg-slate-100 p-2 md:p-4 min-h-screen text-slate-700">
+    <canvas id="starfield"></canvas>
     <div class="max-w-7xl mx-auto space-y-4">
       
       <header class="bg-white px-4 py-3 md:px-6 md:py-4 rounded shadow flex flex-col lg:flex-row justify-between items-start lg:items-center gap-4">
           <div class="flex-none">
-              <h1 class="text-xl font-bold text-slate-800 flex items-center gap-2">🚀 Worker 部署中控 <span class="text-xs bg-purple-600 text-white px-2 py-0.5 rounded ml-2">V10.1.0</span></h1>
-              <div class="text-[10px] text-gray-400 mt-1">安全加固 · 熔断混淆 · 子域名管理 · 收藏管理</div>
+              <h1 class="text-xl font-bold text-slate-800 flex items-center gap-2">🚀 Worker 部署中控 <span class="text-xs bg-purple-600 text-white px-2 py-0.5 rounded ml-2">V10.2.0</span></h1>
+              <div class="text-[10px] text-gray-400 mt-1">安全加固 · 熔断混淆 · 子域名管理 · 星空主题</div>
           </div>
           <div id="logs" class="bg-slate-900 text-green-400 p-2 rounded text-xs font-mono hidden max-h-[80px] lg:max-h-[50px] overflow-y-auto shadow-inner w-full lg:flex-1 lg:mx-4 order-2 lg:order-none"></div>
           
           <div class="flex flex-wrap items-center gap-2 md:gap-3 bg-slate-50 p-2 rounded border border-slate-200 w-full lg:w-auto flex-none text-xs">
+               <button onclick="toggleTheme()" class="theme-toggle" id="theme_btn" title="切换主题">🌙</button>
+               <div class="w-px h-4 bg-gray-300 mx-0"></div>
                <button onclick="openBatchDeployModal()" class="bg-indigo-600 text-white px-2 py-1 rounded hover:bg-indigo-700 font-bold">✨ 批量部署</button>
                <div class="w-px h-4 bg-gray-300 mx-1"></div>
                
@@ -1711,6 +1807,142 @@ function mainHtml() {
               refreshHistory();
           }
       }
+
+      // ============== 星空主题引擎 ==============
+      let starAnimId = null;
+      function initStarfield() {
+          const canvas = document.getElementById('starfield');
+          if (!canvas) return;
+          const ctx = canvas.getContext('2d');
+          let stars = [], shootingStars = [];
+          
+          function resize() {
+              canvas.width = window.innerWidth;
+              canvas.height = window.innerHeight;
+          }
+          resize();
+          window.addEventListener('resize', resize);
+          
+          // 生成星星
+          function createStars() {
+              stars = [];
+              const count = Math.floor((canvas.width * canvas.height) / 3000);
+              for (let i = 0; i < count; i++) {
+                  stars.push({
+                      x: Math.random() * canvas.width,
+                      y: Math.random() * canvas.height,
+                      r: Math.random() * 1.5 + 0.3,
+                      alpha: Math.random(),
+                      delta: (Math.random() * 0.02 + 0.003) * (Math.random() > 0.5 ? 1 : -1),
+                      color: ['#ffffff', '#c4b5fd', '#93c5fd', '#fcd34d', '#a5b4fc'][Math.floor(Math.random() * 5)]
+                  });
+              }
+          }
+          createStars();
+          window.addEventListener('resize', createStars);
+
+          // 流星
+          function maybeShootingStar() {
+              if (Math.random() < 0.008 && shootingStars.length < 3) {
+                  shootingStars.push({
+                      x: Math.random() * canvas.width * 0.7,
+                      y: Math.random() * canvas.height * 0.3,
+                      len: Math.random() * 80 + 40,
+                      speed: Math.random() * 6 + 4,
+                      alpha: 1
+                  });
+              }
+          }
+          
+          function draw() {
+              ctx.clearRect(0, 0, canvas.width, canvas.height);
+              // 深空渐变背景
+              const grad = ctx.createRadialGradient(canvas.width/2, canvas.height/2, 0, canvas.width/2, canvas.height/2, canvas.width*0.7);
+              grad.addColorStop(0, '#0f172a');
+              grad.addColorStop(0.5, '#0c1222');
+              grad.addColorStop(1, '#020617');
+              ctx.fillStyle = grad;
+              ctx.fillRect(0, 0, canvas.width, canvas.height);
+              
+              // 星云光晕
+              const nebula = ctx.createRadialGradient(canvas.width * 0.2, canvas.height * 0.3, 0, canvas.width * 0.2, canvas.height * 0.3, 300);
+              nebula.addColorStop(0, 'rgba(139, 92, 246, 0.03)');
+              nebula.addColorStop(1, 'transparent');
+              ctx.fillStyle = nebula;
+              ctx.fillRect(0, 0, canvas.width, canvas.height);
+              
+              const nebula2 = ctx.createRadialGradient(canvas.width * 0.8, canvas.height * 0.7, 0, canvas.width * 0.8, canvas.height * 0.7, 250);
+              nebula2.addColorStop(0, 'rgba(59, 130, 246, 0.025)');
+              nebula2.addColorStop(1, 'transparent');
+              ctx.fillStyle = nebula2;
+              ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+              // 绘制星星
+              for (const s of stars) {
+                  s.alpha += s.delta;
+                  if (s.alpha <= 0.1 || s.alpha >= 1) s.delta = -s.delta;
+                  ctx.beginPath();
+                  ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2);
+                  ctx.fillStyle = s.color;
+                  ctx.globalAlpha = Math.max(0.1, Math.min(1, s.alpha));
+                  ctx.fill();
+              }
+              ctx.globalAlpha = 1;
+              
+              // 流星
+              maybeShootingStar();
+              shootingStars = shootingStars.filter(m => {
+                  m.x += m.speed; m.y += m.speed * 0.6; m.alpha -= 0.015;
+                  if (m.alpha <= 0) return false;
+                  ctx.save();
+                  ctx.globalAlpha = m.alpha;
+                  const gradient = ctx.createLinearGradient(m.x, m.y, m.x - m.len, m.y - m.len * 0.6);
+                  gradient.addColorStop(0, '#ffffff');
+                  gradient.addColorStop(1, 'transparent');
+                  ctx.strokeStyle = gradient;
+                  ctx.lineWidth = 1.5;
+                  ctx.beginPath();
+                  ctx.moveTo(m.x, m.y);
+                  ctx.lineTo(m.x - m.len, m.y - m.len * 0.6);
+                  ctx.stroke();
+                  ctx.restore();
+                  return true;
+              });
+              
+              starAnimId = requestAnimationFrame(draw);
+          }
+          draw();
+      }
+      
+      function stopStarfield() {
+          if (starAnimId) { cancelAnimationFrame(starAnimId); starAnimId = null; }
+      }
+      
+      function toggleTheme() {
+          const html = document.documentElement;
+          const isDark = html.getAttribute('data-theme') === 'dark';
+          if (isDark) {
+              html.removeAttribute('data-theme');
+              document.getElementById('theme_btn').innerText = '\ud83c\udf19';
+              stopStarfield();
+              localStorage.setItem('worker_theme', 'light');
+          } else {
+              html.setAttribute('data-theme', 'dark');
+              document.getElementById('theme_btn').innerText = '\u2600\ufe0f';
+              initStarfield();
+              localStorage.setItem('worker_theme', 'dark');
+          }
+      }
+      
+      function applyTheme() {
+          const saved = localStorage.getItem('worker_theme');
+          if (saved === 'dark') {
+              document.documentElement.setAttribute('data-theme', 'dark');
+              document.getElementById('theme_btn').innerText = '\u2600\ufe0f';
+              initStarfield();
+          }
+      }
+      applyTheme();
 
       init();
     </script>
