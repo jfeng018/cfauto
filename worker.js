@@ -368,28 +368,21 @@ async function handleManualDeploy(env, type, variables, deletedVariables, accoun
 }
 
 async function handleBatchDeploy(env, reqData, accountsKey) {
-    const { template, workerName, kvName, config, targetAccounts, disableWorkersDev, customDomainPrefix, enableKV, customCode } = reqData;
+    const { template, workerName, kvName, config, targetAccounts, disableWorkersDev, customDomainPrefix, enableKV, savedVars } = reqData;
     const allAccounts = JSON.parse(await env.CONFIG_KV.get(accountsKey) || "[]");
 
     const accountsToDeploy = allAccounts.filter(a => targetAccounts.includes(a.alias));
     if (accountsToDeploy.length === 0) return new Response(JSON.stringify([{ name: "错误", success: false, msg: "未选择有效账号" }]), { headers: { "Content-Type": "application/json" } });
 
     let scriptContent = "";
-    if (customCode) {
-        scriptContent = customCode;
-        if (!scriptContent.includes('var window = globalThis') && !scriptContent.includes('import ')) {
-            scriptContent = 'var window = globalThis;\n' + scriptContent;
-        }
-    } else {
-        const { scriptUrl } = getGithubUrls(template);
-        try {
-            const codeRes = await fetch(scriptUrl);
-            if (!codeRes.ok) throw new Error("代码拉取失败");
-            scriptContent = await codeRes.text();
-            if (template === 'joey') scriptContent = 'var window = globalThis;\n' + scriptContent;
-        } catch (e) {
-            return new Response(JSON.stringify([{ name: "网络错误", success: false, msg: e.message }]), { headers: { "Content-Type": "application/json" } });
-        }
+    const { scriptUrl } = getGithubUrls(template);
+    try {
+        const codeRes = await fetch(scriptUrl);
+        if (!codeRes.ok) throw new Error("代码拉取失败");
+        scriptContent = await codeRes.text();
+        if (template === 'joey') scriptContent = 'var window = globalThis;\n' + scriptContent;
+    } catch (e) {
+        return new Response(JSON.stringify([{ name: "网络错误", success: false, msg: e.message }]), { headers: { "Content-Type": "application/json" } });
     }
 
     const logs = [];
@@ -421,19 +414,29 @@ async function handleBatchDeploy(env, reqData, accountsKey) {
                 if (template === 'joey') bindings.push({ name: "C", type: "kv_namespace", namespace_id: nsId });
             }
 
-            if (config.admin) bindings.push({ name: "ADMIN", type: "plain_text", text: config.admin });
-            if (template === 'joey' && config.uuid) bindings.push({ name: "u", type: "plain_text", text: config.uuid });
-
-            const defaultVars = TEMPLATES[template].defaultVars;
-            defaultVars.forEach(key => {
-                if (key !== 'KV' && key !== 'C' && key !== 'ADMIN' && key !== 'u') {
-                    if (key === 'UUID') {
-                        bindings.push({ name: "UUID", type: "plain_text", text: config.uuid || crypto.randomUUID() });
-                    } else {
-                        bindings.push({ name: key, type: "plain_text", text: "" });
+            // 如果前端传了已保存变量，优先使用
+            if (savedVars && Array.isArray(savedVars) && savedVars.length > 0) {
+                savedVars.forEach(v => {
+                    if (v.key && !bindings.find(b => b.name === v.key)) {
+                        bindings.push({ name: v.key, type: "plain_text", text: v.value || "" });
                     }
-                }
-            });
+                });
+            } else {
+                // 回退到 config 配置
+                if (config.admin) bindings.push({ name: "ADMIN", type: "plain_text", text: config.admin });
+                if (template === 'joey' && config.uuid) bindings.push({ name: "u", type: "plain_text", text: config.uuid });
+
+                const defaultVars = TEMPLATES[template].defaultVars;
+                defaultVars.forEach(key => {
+                    if (key !== 'KV' && key !== 'C' && key !== 'ADMIN' && key !== 'u') {
+                        if (key === 'UUID') {
+                            bindings.push({ name: "UUID", type: "plain_text", text: config.uuid || crypto.randomUUID() });
+                        } else {
+                            bindings.push({ name: key, type: "plain_text", text: "" });
+                        }
+                    }
+                });
+            }
 
             const metadata = { main_module: "index.js", bindings: bindings, compatibility_date: new Date().toISOString().split('T')[0] };
             const formData = new FormData();
@@ -1088,6 +1091,7 @@ function mainHtml() {
           <div class="flex flex-wrap items-center gap-2 md:gap-3 bg-slate-50 p-2 rounded border border-slate-200 w-full lg:w-auto flex-none text-xs">
                <button onclick="toggleTheme()" class="theme-toggle" id="theme_btn" title="切换主题">🌙</button>
                <div class="w-px h-4 bg-gray-300 mx-0"></div>
+               <button onclick="openWorkbench()" id="btn_workbench" class="bg-slate-700 text-white px-2 py-1 rounded hover:bg-slate-800 font-bold">📋 工作台</button>
                <button onclick="openBatchDeployModal()" class="bg-indigo-600 text-white px-2 py-1 rounded hover:bg-indigo-700 font-bold">✨ 批量部署</button>
                <div class="w-px h-4 bg-gray-300 mx-1"></div>
                
@@ -1242,6 +1246,10 @@ function mainHtml() {
                             <input type="checkbox" id="bd_enable_kv" class="w-4 h-4 text-indigo-600 border-gray-300 rounded" checked>
                             <label for="bd_enable_kv" class="font-bold text-gray-700">绑定 KV 存储</label>
                          </div>
+                         <div class="flex items-center gap-2">
+                            <input type="checkbox" id="bd_use_saved_vars" class="w-4 h-4 text-green-600 border-gray-300 rounded" checked>
+                            <label for="bd_use_saved_vars" class="font-bold text-green-700">📦 采用已保存变量 (VARS)</label>
+                         </div>
                     </div>
                 </div>
 
@@ -1351,6 +1359,21 @@ function mainHtml() {
         </div>
     </div>
 
+    <div id="workbench_modal" class="hidden fixed inset-0 z-50" style="pointer-events:none">
+        <div id="workbench_panel" class="bg-slate-900 rounded-xl shadow-2xl flex flex-col border border-slate-700" style="pointer-events:auto;position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);width:700px;max-width:90vw;height:50vh;max-height:80vh;resize:both;overflow:hidden">
+            <div id="workbench_drag" class="flex justify-between items-center px-4 py-2 border-b border-slate-700 cursor-move select-none" style="cursor:move">
+                <h3 class="text-sm font-bold text-green-400 flex items-center gap-2">📋 工作台 <span id="wb_status" class="text-[10px] text-slate-500 font-normal"></span></h3>
+                <div class="flex gap-2">
+                    <button onclick="document.getElementById('workbench_log').innerHTML=''" class="text-[10px] text-slate-500 hover:text-slate-300 border border-slate-600 px-2 py-0.5 rounded">🗑️ 清空</button>
+                    <button onclick="closeWorkbench()" class="text-slate-400 hover:text-white text-lg leading-none">&times;</button>
+                </div>
+            </div>
+            <div id="workbench_log" class="flex-1 overflow-y-auto p-3 text-xs font-mono text-green-400 space-y-0.5">
+                <div class="text-slate-600">// 等待操作...</div>
+            </div>
+        </div>
+    </div>
+
     <script>
       const TEMPLATES = ${JSON.stringify(Object.fromEntries(Object.entries(TEMPLATES).map(([k, v]) => [k, { defaultVars: v.defaultVars, uuidField: v.uuidField, name: v.name }])))};
       const ECH_PROXIES = ${JSON.stringify(ECH_PROXIES)};
@@ -1369,6 +1392,46 @@ function mainHtml() {
           loadStats();
           ['cmliu','joey'].forEach(t => { checkDeployConfig(t); checkUpdate(t); });
       }
+
+      function openWorkbench() {
+          document.getElementById('workbench_modal').classList.remove('hidden');
+      }
+      function closeWorkbench() {
+          document.getElementById('workbench_modal').classList.add('hidden');
+      }
+      function wbLog(msg, colorClass) {
+          const log = document.getElementById('workbench_log');
+          const div = document.createElement('div');
+          if (colorClass) div.className = colorClass;
+          div.textContent = msg;
+          log.appendChild(div);
+          log.scrollTop = log.scrollHeight;
+      }
+
+      // 工作台拖动
+      (function initDrag() {
+          let isDragging = false, startX, startY, startLeft, startTop;
+          document.addEventListener('mousedown', e => {
+              const drag = document.getElementById('workbench_drag');
+              if (!drag || !drag.contains(e.target) || e.target.tagName === 'BUTTON') return;
+              const panel = document.getElementById('workbench_panel');
+              isDragging = true;
+              const rect = panel.getBoundingClientRect();
+              panel.style.transform = 'none';
+              panel.style.left = rect.left + 'px';
+              panel.style.top = rect.top + 'px';
+              startX = e.clientX; startY = e.clientY;
+              startLeft = rect.left; startTop = rect.top;
+              e.preventDefault();
+          });
+          document.addEventListener('mousemove', e => {
+              if (!isDragging) return;
+              const panel = document.getElementById('workbench_panel');
+              panel.style.left = Math.max(0, startLeft + e.clientX - startX) + 'px';
+              panel.style.top = Math.max(0, startTop + e.clientY - startY) + 'px';
+          });
+          document.addEventListener('mouseup', () => { isDragging = false; });
+      })();
 
       async function fetchZonesForAccount() {
           const email = document.getElementById('in_email').value;
@@ -1403,21 +1466,22 @@ function mainHtml() {
           }
       }
 
-      // 批量部署逻辑（核心：包含混淆与 RuntimeFix）
+      // 批量部署逻辑
       async function doBatchDeploy() {
           const btn = document.getElementById('btn_do_batch');
           const t = document.getElementById('bd_template').value;
           const name = document.getElementById('bd_name').value;
           const kvName = document.getElementById('bd_kv_name').value;
           const enableKV = document.getElementById('bd_enable_kv').checked;
+          const useSavedVars = document.getElementById('bd_use_saved_vars').checked;
 
           if (!name) return Swal.fire('提示', 'Worker名称必填', 'warning');
           if (enableKV && !kvName) return Swal.fire('提示', '开启 KV 绑定时必须填写 KV 名称', 'warning');
           
           btn.disabled = true;
           btn.innerText = "⏳ 准备中...";
-          const logBox = document.getElementById('logs');
-          logBox.classList.remove('hidden');
+          openWorkbench();
+          wbLog('✨ 开始批量部署...', 'text-yellow-400');
           
           try {
 
@@ -1433,34 +1497,55 @@ function mainHtml() {
                   config.uuid = document.getElementById('bd_uuid').value;
              }
 
-             const res = await fetch('/api/batch_deploy', {
-                  method: 'POST',
-                  body: JSON.stringify({ 
-                      template: t, 
-                      workerName: name, 
-                      kvName: kvName, 
-                      config: config, 
-                      targetAccounts: targetAccounts,
-                      disableWorkersDev: document.getElementById('bd_disable_workers_dev').checked,
-                      customDomainPrefix: document.getElementById('bd_domain_prefix').value,
-                      enableKV: enableKV,
-                      customCode: customCode 
-                  })
-              });
-              const logs = await res.json();
-              logBox.innerHTML = logs.map(l => {
-                  if (l.success && l.msg.startsWith('✅')) return \`<div>✅ <span class="text-white">\${l.msg.replace('✅ ', '')}</span></div>\`;
-                  return \`<div>[\${l.success ? 'OK' : 'ERR'}] \${l.name}: <span class="text-gray-400">\${l.msg}</span></div>\`;
-              }).join('');
-              
-              document.getElementById('batch_deploy_modal').classList.add('hidden');
-              await loadAccounts(); 
-              Swal.fire('完成', '操作完成，请查看日志', 'success');
+             // 如果勾选了「采用已保存变量」，从 KV 读取并合并
+              let savedVars = null;
+              if (useSavedVars) {
+                  wbLog('📦 读取已保存变量 (VARS_' + t + ')...', 'text-blue-300');
+                  try {
+                      const vr = await fetch(\`/api/settings?type=\${t}\`);
+                      savedVars = await vr.json();
+                      if (Array.isArray(savedVars) && savedVars.length > 0) {
+                          wbLog(\`✅ 读取到 \${savedVars.length} 个变量\`, 'text-green-300');
+                          // 将 config 中的值合并到 savedVars
+                          Object.entries(config).forEach(([k, v]) => {
+                              if (v) {
+                                  const idx = savedVars.findIndex(sv => sv.key === k);
+                                  if (idx !== -1) savedVars[idx].value = v;
+                                  else savedVars.push({ key: k, value: v });
+                              }
+                          });
+                      } else { savedVars = null; }
+                  } catch(e) { savedVars = null; }
+              }
 
-          } catch(e) { 
-              Swal.fire('错误', '部署失败: ' + e.message, 'error'); 
-              logBox.innerHTML += \`<div class="text-red-500">❌ Error: \${e.message}</div>\`;
-          }
+              const res = await fetch('/api/batch_deploy', {
+                   method: 'POST',
+                   body: JSON.stringify({ 
+                       template: t, 
+                       workerName: name, 
+                       kvName: kvName, 
+                       config: config, 
+                       targetAccounts: targetAccounts,
+                       disableWorkersDev: document.getElementById('bd_disable_workers_dev').checked,
+                       customDomainPrefix: document.getElementById('bd_domain_prefix').value,
+                       enableKV: enableKV,
+                       savedVars: savedVars 
+                   })
+               });
+              const logs = await res.json();
+               logs.forEach(l => {
+                   if (l.success && l.msg.startsWith('✅')) wbLog(\`✅ \${l.msg.replace('✅ ', '')}\`, 'text-white');
+                   else wbLog(\`[\${l.success ? 'OK' : 'ERR'}] \${l.name}: \${l.msg}\`, l.success ? '' : 'text-red-400');
+               });
+               
+               document.getElementById('batch_deploy_modal').classList.add('hidden');
+               await loadAccounts(); 
+               Swal.fire('完成', '操作完成，请查看工作台', 'success');
+
+           } catch(e) { 
+               Swal.fire('错误', '部署失败: ' + e.message, 'error'); 
+               wbLog(\`❌ Error: \${e.message}\`, 'text-red-500');
+           }
           btn.disabled = false;
           btn.innerText = "🚀 开始部署";
       }
@@ -1733,34 +1818,40 @@ function mainHtml() {
          const btn = document.getElementById(\`btn_deploy_\${t}\`); const ot = btn.innerText; btn.innerText = "⏳ 部署中..."; btn.disabled = true;
          const vars = []; document.querySelectorAll(\`.var-row-\${t}\`).forEach(r => { const k = r.querySelector('.key').value; const v = r.querySelector('.val').value; if(k) vars.push({key: k, value: v}); });
          await fetch(\`/api/settings?type=\${t}\`, {method: 'POST', body: JSON.stringify(vars)});
-         const logBox = document.getElementById('logs'); logBox.classList.remove('hidden'); logBox.innerHTML = \`<div class="text-yellow-400">⚡ Deploying \${t}...</div>\`;
+         openWorkbench();
+         wbLog(\`⚡ Deploying \${t}...\`, 'text-yellow-400');
          try {
              const res = await fetch(\`/api/deploy?type=\${t}\`, { method: 'POST', body: JSON.stringify({ type: t, variables: vars, deletedVariables: deletedVars[t], targetSha: sha }) });
              const logs = await res.json();
-             logBox.innerHTML += logs.map(l => \`<div>[\${l.success ? 'OK' : 'ERR'}] \${l.name}: <span class="text-gray-400">\${l.msg}</span></div>\`).join('');
+             logs.forEach(l => wbLog(\`[\${l.success ? 'OK' : 'ERR'}] \${l.name}: \${l.msg}\`, l.success ? '' : 'text-red-400'));
              deletedVars[t] = [];
              setTimeout(() => { checkUpdate(t); checkDeployConfig(t); }, 1000);
-         } catch(e) { logBox.innerHTML += \`<div class="text-red-500">Error: \${e.message}</div>\`; }
+         } catch(e) { wbLog(\`Error: \${e.message}\`, 'text-red-500'); }
          btn.innerText = ot; btn.disabled = false;
       }
 
       async function fix1101(t) {
           const confirm = await Swal.fire({
-              title: '\ud83d\udd27 \u4e00\u952e\u4fee\u590d 1101',
-              html: \`<div class="text-left text-sm"><p class="mb-2">\u5c06\u5bf9\u6240\u6709\u8d26\u53f7\u6267\u884c\uff1a</p><ol class="list-decimal pl-5 space-y-1"><li>\ud83d\udccb \u8bb0\u5f55 Worker \u53d8\u91cf\u7ed1\u5b9a</li><li>\ud83d\uddd1\ufe0f \u5220\u9664 Worker</li><li>\ud83c\udf10 \u968f\u673a\u4fee\u6539\u5b50\u57df\u540d</li><li>\ud83d\ude80 \u7528\u76f8\u540c\u540d\u79f0\u91cd\u5efa\uff08\u5e26\u6df7\u6dc6\uff09</li><li>\u267b\ufe0f \u6062\u590d\u6240\u6709\u53d8\u91cf\u503c</li></ol><p class="mt-3 text-orange-600 font-bold">\u26a0\ufe0f \u5b50\u57df\u540d\u53d8\u66f4\u5f71\u54cd\u8be5\u8d26\u53f7\u4e0b\u6240\u6709 Worker\uff01</p></div>\`,
+              title: '🔧 一键修复 1101',
+              html: '<div class="text-left text-sm"><p class="mb-2">将对所有账号执行：</p><ol class="list-decimal pl-5 space-y-1"><li>📋 记录变量绑定 + 自定义域名</li><li>🗑️ 删除 Worker</li><li>🌐 随机修改子域名</li><li>🚀 用相同名称重建</li><li>♻️ 恢复所有变量值 + 自定义域名</li></ol><p class="mt-3 text-orange-600 font-bold">⚠️ 子域名变更影响该账号下所有 Worker！</p></div>',
               icon: 'warning', showCancelButton: true,
-              confirmButtonText: '\u6267\u884c\u4fee\u590d', cancelButtonText: '\u53d6\u6d88',
+              confirmButtonText: '执行修复', cancelButtonText: '取消',
               confirmButtonColor: '#f97316'
           });
           if (!confirm.isConfirmed) return;
-          const btn = document.getElementById(\`btn_fix1101_\${t}\`); const ot = btn.innerText; btn.innerText = '\u23f3 \u4fee\u590d\u4e2d...'; btn.disabled = true;
-          const logBox = document.getElementById('logs'); logBox.classList.remove('hidden'); logBox.innerHTML = \`<div class="text-orange-400">\ud83d\udd27 \u6b63\u5728\u4fee\u590d \${t} \u7684 1101...</div>\`;
+          const btn = document.getElementById('btn_fix1101_' + t); const ot = btn.innerText; btn.innerText = '⏳ 修复中...'; btn.disabled = true;
+          openWorkbench();
+          wbLog('🔧 正在修复 ' + t + ' 的 1101...', 'text-orange-400');
           try {
               const res = await fetch('/api/fix_1101', { method: 'POST', body: JSON.stringify({ type: t }) });
               const logs = await res.json();
-              logBox.innerHTML += logs.map(l => \`<div>[\${l.success ? 'OK' : 'ERR'}] \${l.name}: <span class="text-gray-400">\${l.msg}</span></div>\`).join('');
+              logs.forEach(l => {
+                  const color = l.success ? 'text-green-300' : 'text-red-400';
+                  wbLog('[' + (l.success ? '✅' : '❌') + '] ' + l.name, color);
+                  if (l.msg) l.msg.split(' | ').forEach(s => wbLog('   ' + s, 'text-slate-400'));
+              });
               setTimeout(() => { checkUpdate(t); checkDeployConfig(t); }, 1000);
-          } catch(e) { logBox.innerHTML += \`<div class="text-red-500">Error: \${e.message}</div>\`; }
+          } catch(e) { wbLog('Error: ' + e.message, 'text-red-500'); }
           btn.innerText = ot; btn.disabled = false;
       }
 
